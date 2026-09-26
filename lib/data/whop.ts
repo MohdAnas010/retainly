@@ -95,17 +95,23 @@ export class WhopSdkAdapter implements RetainlyDataAdapter {
     const companyKey = process.env.WHOP_COMPANY_ID ?? companyId;
 
     // 1. Plans: id -> { name, priceCents, recurring }.
+    // Wrapped in try/catch: if the API key lacks plan:basic:read the
+    // dashboard still renders (plan names fall back to IDs, MRR to 0).
     const plans = new Map<string, PlanInfo>();
-    const plansPage = await this.client.plans.list({
-      account_id: companyKey,
-      first: 100,
-    });
-    for await (const plan of plansPage) {
-      plans.set(plan.id, {
-        name: plan.title ?? plan.id,
-        priceCents: plan.initial_price ?? 0,
-        recurring: plan.billing_period != null,
+    try {
+      const plansPage = await this.client.plans.list({
+        account_id: companyKey,
+        first: 100,
       });
+      for await (const plan of plansPage) {
+        plans.set(plan.id, {
+          name: plan.title ?? plan.id,
+          priceCents: plan.initial_price ?? 0,
+          recurring: plan.billing_period != null,
+        });
+      }
+    } catch {
+      // plan:basic:read missing on the key — degrade gracefully.
     }
 
     // 2. Member rows: userId -> { name, lastActiveAt } (seller-visible).
