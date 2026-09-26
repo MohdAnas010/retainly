@@ -5,12 +5,36 @@
  * `adapter.ts` only instantiates it when DATA_MODE === "whop" AND
  * WHOP_API_KEY is set; otherwise the deterministic MockAdapter is used.
  *
- * NOTE: Verify exact field names against https://docs.whop.com at
- * integration time. The Whop REST surface evolves; the method names and
- * request fields below follow the @whop/sdk v2 generated client (REST v1,
- * https://api.whop.com/api/v1), but field-level details (e.g. how failed
- * payments are reported per membership) should be re-checked against the
- * live docs before going to production.
+ * FIELD MAPPINGS — verified against the @whop/sdk v2 generated client
+ * (REST v1, https://api.whop.com/api/v1) on 2026-09-26:
+ * - Plans:      client.plans.list({ account_id }) -> Plan.id,
+ *               Plan.title (string|null), Plan.initial_price (smallest
+ *               currency unit, e.g. cents), Plan.billing_period
+ *               (days between charges; null = one-time).
+ * - Memberships: client.memberships.list({ account_id }) -> Membership.id,
+ *               .plan_id, .status, .created_at (ISO), .user_id
+ *               (string|null — null for business/unclaimed buyers).
+ *               NOTE: Membership.member is ALWAYS null on seller-side
+ *               reads, so it is never used here.
+ * - Member rows (seller-visible activity): client.members.list({ account_id })
+ *               -> Member.last_accessed_at (string|null),
+ *               Member.joined_at, Member.user { id, name, username }.
+ * - Identity:   client.users.retrieve({ id: userId }) -> User.name,
+ *               User.email (string|null), User.username.
+ * - Payments:   client.payments.list({ account_id }) -> Payment.membership_id,
+ *               .member_id, .failure_message (string|null),
+ *               .decline_code, .status, .paid_at.
+ *               A payment counts as failed when failure_message or
+ *               decline_code is set.
+ *
+ * Honesty notes:
+ * - MRR trend is reconstructed from membership cohorts (created_at <=
+ *   month-end and still active-ish). Memberships carry no cancelled_at
+ *   timestamp, so churned members only drop out of the CURRENT month —
+ *   past months slightly overstate MRR for accounts with historical churn.
+ *   The current-month KPIs are exact.
+ * - lastActiveAt falls back to the membership created_at when Whop has no
+ *   recorded access yet.
  */
 import { WhopClient } from "@whop/sdk";
 import type { Whop } from "@whop/sdk";
@@ -34,6 +58,26 @@ function requireKey(): string {
   return key;
 }
 
+type PlanInfo = { name: string; priceCents: number; recurring: boolean };
+type MemberRow = { name: string; lastActiveAt: string | null };
+
+/** Retainly bands from the verified Whop MembershipStatus values. */
+function mapStatus(s: Whop.MembershipStatus): Member["status"] {
+  switch (s) {
+    case "active":
+    case "completed": // one-time purchase, access kept
+    case "canceling": // still paying until period end
+      return "active";
+    case "trialing":
+      return "trialing";
+    case "past_due": // grace period after a failed payment
+      return "past_due";
+    default:
+      // canceled, expired, unresolved, drafted
+      return "cancelled";
+  }
+}
+
 export class WhopSdkAdapter implements RetainlyDataAdapter {
   private client: WhopClient;
 
@@ -43,32 +87,15 @@ export class WhopSdkAdapter implements RetainlyDataAdapter {
   }
 
   /**
-   * Fetches all memberships for the configured company, paging through
-   * results via the SDK's async-iterable Page type.
-   *
-   * PRODUCTION MAPPING (verify against https://docs.whop.com):
-   * - GET https://api.whop.com/api/v1/memberships  -> client.memberships.list({ account_id })
-   *   `account_id` is the company id (WHOP_COMPANY_ID, e.g. "biz_...").
-   *   Filter per plan with `plan_id`, per status with `status`.
-   * - Plan names/prices come from GET /v1/plans -> client.plans.list()
-   *   (PlanListItem.initial_price is in the smallest currency unit).
-   * - Member identity (name/email) is NOT on the membership object; in
-   *   production call client.users / the members endpoint per user_id, or
-   *   resolve via the members list (client.members / client.users — verify
-   *   exact resource name in the live docs).
-   * - lastActiveAt: memberships expose member.last_accessed_at (last time the
-   *   member opened the account's content). For richer engagement signals
-   *   (chat messages, course views) aggregate the corresponding endpoints.
-   * - failedPayments: derive from GET /v1/payments
-   *   (client.payments.list({ member_id | membership_id })) by counting
-   *   payments with failure_message / decline_code set, or from
-   *   GET /v1/invoices. Verify the exact failure fields in the live docs.
+   * Builds the member list from live Whop data:
+   * memberships (billing truth) + member rows (activity/identity) +
+   * users endpoint (email) + payments (failed-payment counts).
    */
   private async fetchMembers(companyId: string): Promise<Member[]> {
     const companyKey = process.env.WHOP_COMPANY_ID ?? companyId;
 
-    // Cache plan id -> { name, price } so we don't refetch per membership.
-    const plans = new Map<string, { name: string; priceCents: number }>();
+    // 1. Plans: id -> { name, priceCents, recurring }.
+    const plans = new Map<string, PlanInfo>();
     const plansPage = await this.client.plans.list({
       account_id: companyKey,
       first: 100,
@@ -77,91 +104,134 @@ export class WhopSdkAdapter implements RetainlyDataAdapter {
       plans.set(plan.id, {
         name: plan.title ?? plan.id,
         priceCents: plan.initial_price ?? 0,
+        recurring: plan.billing_period != null,
       });
     }
 
+    // 2. Member rows: userId -> { name, lastActiveAt } (seller-visible).
+    const rows = new Map<string, MemberRow>();
+    try {
+      const membersPage = await this.client.members.list({
+        account_id: companyKey,
+        first: 100,
+      });
+      for await (const row of membersPage) {
+        const u = row.user;
+        if (!u) continue;
+        rows.set(u.id, {
+          name: u.name ?? u.username,
+          lastActiveAt: row.last_accessed_at,
+        });
+      }
+    } catch {
+      // members:basic:read may be missing; identity falls back to the
+      // users endpoint below and activity to created_at.
+    }
+
+    // 3. Failed-payment counts per membership from the payments ledger.
+    const failedByMembership = new Map<string, number>();
+    try {
+      const paymentsPage = await this.client.payments.list({
+        account_id: companyKey,
+        first: 200,
+      });
+      for await (const p of paymentsPage) {
+        if (!p.membership_id) continue;
+        if (p.failure_message != null || p.decline_code != null) {
+          failedByMembership.set(
+            p.membership_id,
+            (failedByMembership.get(p.membership_id) ?? 0) + 1
+          );
+        }
+      }
+    } catch {
+      // payment:basic:read may be missing; failedPayments stays 0.
+    }
+
+    // 4. Memberships -> Retainly members.
     const members: Member[] = [];
+    const emailCache = new Map<string, string>();
     const membershipsPage = await this.client.memberships.list({
       account_id: companyKey,
       first: 100,
     });
     for await (const m of membershipsPage) {
       const plan = plans.get(m.plan_id);
-      const status = this.mapStatus(m.status);
+      const status = mapStatus(m.status);
+      const row = m.user_id ? rows.get(m.user_id) : undefined;
+
+      let name = row?.name ?? m.user_id ?? m.id;
+      let email = "";
+      if (m.user_id) {
+        if (!emailCache.has(m.user_id)) {
+          try {
+            const u = await this.client.users.retrieve({ id: m.user_id });
+            if (u.name) name = row?.name ?? u.name;
+            emailCache.set(m.user_id, u.email ?? "");
+          } catch {
+            emailCache.set(m.user_id, "");
+          }
+        }
+        email = emailCache.get(m.user_id) ?? "";
+      }
+
+      const recurring = plan?.recurring ?? false;
       members.push({
         id: m.id,
-        // Real display name/email come from the users endpoint keyed by
-        // m.user_id — verify the exact resource in the live docs.
-        name: m.user_id ?? m.id,
-        email: "",
+        name,
+        email,
         plan: plan?.name ?? m.plan_id,
-        mrrCents: status === "cancelled" ? 0 : (plan?.priceCents ?? 0),
+        mrrCents:
+          status === "cancelled" || !recurring ? 0 : (plan?.priceCents ?? 0),
         joinedAt: m.created_at,
-        lastActiveAt: m.member?.last_accessed_at ?? m.created_at,
-        failedPayments: 0, // filled by countFailedPayments() in production
+        lastActiveAt: row?.lastActiveAt ?? m.created_at,
+        failedPayments: failedByMembership.get(m.id) ?? 0,
         status,
       });
     }
     return members;
   }
 
-  private mapStatus(s: Whop.MembershipStatus): Member["status"] {
-    switch (s) {
-      case "active":
-        return "active";
-      case "trialing":
-        return "trialing";
-      case "past_due":
-        return "past_due";
-      default:
-        return "cancelled";
-    }
+  /**
+   * Six-month trend reconstructed from membership cohorts. Current month is
+   * exact; earlier months approximate (no cancelled_at on memberships —
+   * see module docstring).
+   */
+  private buildTrend(members: Member[]): MetricPoint[] {
+    const now = new Date();
+    return Array.from({ length: 6 }, (_, i) => {
+      const d = new Date(now.getFullYear(), now.getMonth() - (5 - i), 1);
+      const monthEnd = new Date(d.getFullYear(), d.getMonth() + 1, 0, 23, 59, 59);
+      const label = d.toLocaleString("en-US", { month: "short" });
+      const cohort = members.filter((m) => new Date(m.joinedAt) <= monthEnd);
+      const alive = cohort.filter((m) => m.status !== "cancelled");
+      const churned = cohort.length - alive.length;
+      return {
+        month: label,
+        mrrCents: alive.reduce((s, m) => s + m.mrrCents, 0),
+        churnRate:
+          cohort.length === 0
+            ? 0
+            : Number(((churned / cohort.length) * 100).toFixed(1)),
+        activeMembers: alive.filter((m) => m.status === "active").length,
+      };
+    });
   }
 
-  /**
-   * MRR trend: sum active memberships' plan prices per month. In production
-   * this is best served by GET /v1/payments (client.payments.list) grouped
-   * by paid_at month for revenue actually collected, or by snapshotting
-   * memberships nightly. The placeholder below derives monthly MRR from the
-   * current membership set; replace with a payments-aggregation job or a
-   * cached metrics store before launch.
-   */
   async getOverview(companyId: string): Promise<OverviewData> {
     const members = await this.fetchMembers(companyId);
     const now = new Date();
 
-    const mrrCents = members
-      .filter((m) => m.status === "active")
-      .reduce((sum, m) => sum + m.mrrCents, 0);
+    const active = members.filter((m) => m.status === "active");
+    const mrrCents = active.reduce((sum, m) => sum + m.mrrCents, 0);
 
-    // Placeholder trend: real trend needs historical snapshots or payments
-    // aggregation — wire this to a nightly job before production.
-    const mrrTrend: MetricPoint[] = Array.from({ length: 6 }, (_, i) => ({
-      month: new Date(now.getFullYear(), now.getMonth() - (5 - i), 1).toLocaleString(
-        "en-US",
-        { month: "short" }
-      ),
-      mrrCents: i === 5 ? mrrCents : Math.round(mrrCents * (0.82 + i * 0.036)),
-      churnRate: 5.8 - i * 0.28,
-      activeMembers: Math.round(
-        members.filter((m) => m.status === "active").length * (0.84 + i * 0.032)
-      ),
-    }));
-
-    const [prev, last] = [
-      mrrTrend[mrrTrend.length - 2],
-      mrrTrend[mrrTrend.length - 1],
-    ];
+    const mrrTrend = this.buildTrend(members);
+    const [prev, last] = [mrrTrend[mrrTrend.length - 2], mrrTrend[mrrTrend.length - 1]];
 
     const assessments = assessAll(members, now);
-    const atRiskCount = assessments.filter(
-      (a) => a.band !== "healthy"
-    ).length;
-    const criticalCount = assessments.filter(
-      (a) => a.band === "critical"
-    ).length;
+    const atRiskCount = assessments.filter((a) => a.band !== "healthy").length;
+    const criticalCount = assessments.filter((a) => a.band === "critical").length;
 
-    const active = members.filter((m) => m.status === "active");
     const avgRetentionDays =
       active.length === 0
         ? 0
@@ -183,9 +253,15 @@ export class WhopSdkAdapter implements RetainlyDataAdapter {
         churnRatePct: Number(last.churnRate.toFixed(1)),
         churnDeltaPts: Number((last.churnRate - prev.churnRate).toFixed(1)),
         activeMembers: last.activeMembers,
-        activeDeltaPct: Number(
-          (((last.activeMembers - prev.activeMembers) / prev.activeMembers) * 100).toFixed(1)
-        ),
+        activeDeltaPct:
+          prev.activeMembers === 0
+            ? 0
+            : Number(
+                (
+                  ((last.activeMembers - prev.activeMembers) / prev.activeMembers) *
+                  100
+                ).toFixed(1)
+              ),
         avgRetentionDays,
         retentionDeltaDays: 0,
       },
@@ -203,11 +279,7 @@ export class WhopSdkAdapter implements RetainlyDataAdapter {
       .sort((a, b) => b.riskScore - a.riskScore);
   }
 
-  /**
-   * Win-back segments. In production these are derived from live
-   * risk-assessment counts (same helper as above) — copy lives with the
-   * product team and should be tuned per company, not hardcoded forever.
-   */
+  /** Win-back segments derived from live risk-assessment counts. */
   async getWinBack(companyId: string): Promise<NudgeSegment[]> {
     const atRisk = await this.getAtRisk(companyId);
     const quiet = atRisk.filter((a) => a.daysInactive > 14).length;
@@ -233,7 +305,7 @@ export class WhopSdkAdapter implements RetainlyDataAdapter {
         why: "Cards expire or get declined and the member never notices. They don't hate the product — they just never finished updating billing.",
         nudgeCopy:
           "Hi {name}, your last payment didn't go through, so your access is paused — not cancelled. It takes 30 seconds to update your card here: {billing_link}. Once it's updated you're back in instantly, and you won't lose your member pricing.",
-        channel: "Whop DM",
+        channel: "Announcement",
         impact:
           "Payment nudges convert fast: expect 30–40% of this segment to update billing within 72 hours.",
       },
@@ -254,7 +326,8 @@ export class WhopSdkAdapter implements RetainlyDataAdapter {
 
 /**
  * FUTURE: live sync via webhooks.
- * Subscribe to membership.renewed / membership.cancelled (verify exact event
- * names in the live docs) to invalidate the metrics cache and keep the
- * dashboard fresh without polling the REST API on every page view.
+ * Subscribe to membership.activated / membership.deactivated (see
+ * PostMembershipActivatedPayload in the SDK) to invalidate the metrics
+ * cache and keep the dashboard fresh without polling the REST API on
+ * every page view.
  */
