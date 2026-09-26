@@ -12,9 +12,10 @@
  * live in `@whop/api` (Whop's app-framework SDK). The `@whop/sdk` v2 package
  * is a pure REST resource client and does not export them.
  *
- * Demo mode: with no WHOP_API_KEY set, only `/dashboard/demo` is reachable
- * (mock data). Every other company id throws a clear error telling the owner
- * exactly what to paste into .env. No real secrets are ever handled here.
+ * Demo mode: `/dashboard/demo` is always public (mock data) — it is the
+ * marketing demo linked from /discover and the App Store listing. Every other
+ * company id requires WHOP_API_KEY and a Whop admin/owner session. No real
+ * secrets are ever handled here.
  */
 import { headers } from "next/headers";
 import { verifyUserToken, WhopServerSdk } from "@whop/api";
@@ -46,16 +47,18 @@ export function getWhopServerSdk() {
 /**
  * Gate for every /dashboard/* route. Call at the top of the dashboard layout.
  *
- * - No WHOP_API_KEY + companyId === "demo"  → demo mode (mock data, no auth).
- * - No WHOP_API_KEY + any other companyId   → throws: owner must add keys.
- * - WHOP_API_KEY set                        → verifies the Whop user token and
+ * - companyId === "demo" → demo mode (mock data, no auth), always.
+ * - No WHOP_API_KEY + any other companyId → throws: owner must add keys.
+ * - WHOP_API_KEY set + real companyId     → verifies the Whop user token and
  *   requires the user to be an admin or owner of the company; otherwise throws.
  */
 export async function requireDashboardAccess(
   companyId: string
 ): Promise<DashboardAccess> {
+  // The public demo never requires Whop auth — it serves mock data only.
+  if (companyId === "demo") return { mode: "demo" };
+
   if (!process.env.WHOP_API_KEY) {
-    if (companyId === "demo") return { mode: "demo" };
     throw new Error(
       "[retainly] WHOP_API_KEY is not set — only the demo company (/dashboard/demo) " +
         "is available. To connect a real company, the owner must paste WHOP_API_KEY and " +
