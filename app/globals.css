@@ -1,0 +1,87 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ————————————————————————————————————————————————————————————————
+   Frosted UI design tokens (Whop design system)
+   ————————————————————————————————————————————————————————————————
+   The Frosted UI component runtime (@whop/frosted-ui) is canary-only and
+   ships a Tailwind v3 pipeline with a React 18 peer dependency — both
+   incompatible with this app's React 19 + Tailwind v4 stack. Instead of
+   the component runtime, we adopt Frosted's published theme tokens
+   (the "whop" palette: primary, field-highlight, success, warning,
+   error, info + dark surfaces) directly as theme-aware CSS variables,
+   mapped into Tailwind via `@theme inline`. The visual language stays
+   Whop-native in light and dark mode, and `typecheck` + `next build`
+   stay green. */
+:root {
+  --frosted-primary: #ff6243;
+  --frosted-primary-hover: #c2431f;
+  --frosted-highlight: #625bf6;
+  --frosted-highlight-hover: #4842c4;
+  --frosted-success: #3d9a1f;
+  --frosted-warning: #b78e00;
+  --frosted-error: #e02b2b;
+  --frosted-info: #16a0fb;
+  --frosted-surface: #ffffff;
+  --frosted-surface-subtle: #f6f6f4;
+  --frosted-stroke: #e7e5e4;
+}
+
+.dark {
+  --frosted-primary: #ff6243;
+  --frosted-primary-hover: #ff7a5c;
+  --frosted-highlight: #7d69f7;
+  --frosted-highlight-hover: #9a8cff;
+  --frosted-success: #4ab325;
+  --frosted-warning: #e2b100;
+  --frosted-error: #ff4d4d;
+  --frosted-info: #16a0fb;
+  --frosted-surface: #191919;
+  --frosted-surface-subtle: #232323;
+  --frosted-stroke: #333333;
+}
+
+@theme inline {
+  --color-frosted-primary: var(--frosted-primary);
+  --color-frosted-primary-hover: var(--frosted-primary-hover);
+  --color-frosted-highlight: var(--frosted-highlight);
+  --color-frosted-highlight-hover: var(--frosted-highlight-hover);
+  --color-frosted-success: var(--frosted-success);
+  --color-frosted-warning: var(--frosted-warning);
+  --color-frosted-error: var(--frosted-error);
+  --color-frosted-info: var(--frosted-info);
+  --color-frosted-surface: var(--frosted-surface);
+  --color-frosted-surface-subtle: var(--frosted-surface-subtle);
+  --color-frosted-stroke: var(--frosted-stroke);
+}
+
+/* Chart theme tokens: charts read these CSS variables so they stay
+   theme-aware in light and dark mode. */
+:root {
+  --chart-mrr: var(--frosted-highlight);
+  --chart-retention: #0ea5e9;
+  --chart-grid: #e5e7eb;
+  --chart-tick: #6b7280;
+}
+
+.dark {
+  --chart-mrr: var(--frosted-highlight);
+  --chart-retention: #38bdf8;
+  --chart-grid: #1f2937;
+  --chart-tick: #9ca3af;
+}
+
+/* Slim, neutral scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+.dark * {
+  scrollbar-color: #374151 transparent;
+}
+
+body {
+  font-feature-settings: "cv11", "ss01";
+  -webkit-font-smoothing: antialiased;
+}
